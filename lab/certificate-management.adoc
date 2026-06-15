@@ -1,0 +1,660 @@
+= OpenShift Certificate Management
+
+Certificates are fundamental to securing communication in an OpenShift
+cluster. In this lab, you will learn how to examine the certificates that
+OpenShift manages automatically, understand their expiration and renewal
+behavior, and then install the cert-manager Operator to manage application
+certificates using a self-signed issuer.
+
+By the end of this lab you will understand:
+
+* What certificates exist in a running OpenShift cluster
+* How to check certificate expiration dates
+* The difference between platform-managed and user-managed certificates
+* How to install and use the cert-manager Operator
+* How to create a self-signed Issuer and request a Certificate
+
+=== Background: Certificates in OpenShift
+
+OpenShift uses TLS certificates extensively to secure communication between
+components. These fall into two categories:
+
+* **Platform-managed certificates** — automatically generated and renewed by
+  OpenShift (etcd, node, Service CA, control plane, monitoring)
+* **User-managed certificates** — certificates that administrators are
+  responsible for providing and renewing (API server, ingress, proxy)
+
+Most administrators never need to touch platform-managed certificates. They
+rotate automatically. However, understanding what exists and when things
+expire is critical for day-2 operations.
+
+=== Part 1: Examining Cluster Certificates
+
+==== Login as cluster admin
+
+[source,bash,role="execute"]
+----
+oc login -u kubeadmin -p {{ KUBEADMIN_PASSWORD }}
+----
+
+==== View the cluster CA bundle
+
+OpenShift maintains a ConfigMap containing the CA bundle that all pods use to
+trust internal services:
+
+[source,bash,role="execute"]
+----
+oc get configmap -n openshift-config-managed default-ingress-cert -o yaml
+----
+
+This ConfigMap contains the default ingress CA certificate. You can also
+view the service CA bundle:
+
+[source,bash,role="execute"]
+----
+oc get configmap -n openshift-service-ca-operator signing-cabundle -o yaml | head -30
+----
+
+==== Check API server certificate
+
+The API server certificate is what your `oc` client and the web console use.
+Examine it with `openssl`:
+
+[source,bash,role="execute"]
+----
+API_URL=$(oc whoami --show-server)
+API_HOST=$(echo $API_URL | sed 's|https://||' | sed 's|:.*||')
+echo | openssl s_client -connect ${API_HOST}:6443 -servername ${API_HOST} 2>/dev/null | openssl x509 -noout -subject -issuer -dates
+----
+
+You should see output showing:
+
+* **subject** — the API server hostname
+* **issuer** — the CA that signed it (either the cluster's self-signed CA or
+  a custom CA if one was configured)
+* **notBefore / notAfter** — the validity period
+
+==== Check ingress (router) certificate
+
+The ingress certificate secures `*.apps.<cluster>.<domain>` routes:
+
+[source,bash,role="execute"]
+----
+INGRESS_HOST=$(oc get ingress.config.openshift.io cluster -o jsonpath='{.spec.domain}')
+echo | openssl s_client -connect ${INGRESS_HOST}:443 -servername "console-openshift-console.${INGRESS_HOST}" 2>/dev/null | openssl x509 -noout -subject -issuer -dates
+----
+
+==== List all certificate Secrets in the cluster
+
+Certificates in OpenShift are typically stored as *Secrets* of type
+`kubernetes.io/tls`. Let's find them across all namespaces:
+
+[source,bash,role="execute"]
+----
+oc get secrets --all-namespaces --field-selector type=kubernetes.io/tls --no-headers | wc -l
+----
+
+That number may surprise you — a typical cluster has dozens of TLS secrets.
+Let's look at where they live:
+
+[source,bash,role="execute"]
+----
+oc get secrets --all-namespaces --field-selector type=kubernetes.io/tls --no-headers | awk '{print $1}' | sort | uniq -c | sort -rn | head -15
+----
+
+This shows which namespaces have the most TLS secrets. You'll typically see
+`openshift-ingress`, `openshift-etcd`, `openshift-kube-apiserver`, and others
+near the top.
+
+==== Check certificate expiration dates
+
+This is one of the most practical day-2 skills. Let's check the expiration
+dates of certificates in the `openshift-ingress` namespace:
+
+[source,bash,role="execute"]
+----
+for secret in $(oc get secrets -n openshift-ingress --field-selector type=kubernetes.io/tls -o jsonpath='{.items[*].metadata.name}'); do
+  echo "--- ${secret} ---"
+  oc get secret -n openshift-ingress ${secret} -o jsonpath='{.data.tls\.crt}' | base64 -d 2>/dev/null | openssl x509 -noout -subject -dates 2>/dev/null
+  echo ""
+done
+----
+
+Now check the etcd certificates:
+
+[source,bash,role="execute"]
+----
+for secret in $(oc get secrets -n openshift-etcd --field-selector type=kubernetes.io/tls -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+  echo "--- ${secret} ---"
+  oc get secret -n openshift-etcd ${secret} -o jsonpath='{.data.tls\.crt}' | base64 -d 2>/dev/null | openssl x509 -noout -subject -dates 2>/dev/null
+  echo ""
+done
+----
+
+[Note]
+====
+Platform-managed certificates renew automatically. For example:
+
+* **Service CA** — 26 month validity, auto-renews at 13 months
+* **Node certificates** — 365 day validity, auto-renews at 30 days remaining
+* **Etcd** — 10 year CA / 3 year certificates, auto-renewed
+* **Control plane** — ranges from 1 month to 2 years, auto-renewed
+
+The certificates you need to worry about are user-managed: **API server**,
+**ingress**, and **proxy** certificates — these do NOT auto-renew.
+====
+
+==== Check the Service CA expiration
+
+The Service CA is used to sign certificates for services within the cluster.
+It has a 26-month validity:
+
+[source,bash,role="execute"]
+----
+oc get secret -n openshift-service-ca signing-key -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject -dates
+----
+
+==== Check cluster operator certificate status
+
+OpenShift cluster operators report certificate-related issues in their
+conditions. Let's check if any operators are reporting problems:
+
+[source,bash,role="execute"]
+----
+oc get clusteroperators -o json | jq -r '.items[] | select(.status.conditions[] | select(.type == "Degraded" and .status == "True")) | .metadata.name'
+----
+
+If nothing is returned, all operators are healthy. If any are listed, you can
+investigate with:
+
+[source,bash,role="execute"]
+----
+oc get clusteroperator <operator-name> -o json | jq '.status.conditions'
+----
+
+=== Part 2: cert-manager Operator
+
+The cert-manager Operator automates the lifecycle of application certificates.
+It integrates with external certificate authorities and enables developer
+self-service for TLS certificates. In this section, we will install
+cert-manager, create a self-signed issuer, and request a certificate.
+
+==== Install cert-manager Operator
+
+Make sure you are logged in as `kubeadmin`:
+
+[source,bash,role="execute"]
+----
+oc login -u kubeadmin -p {{ KUBEADMIN_PASSWORD }}
+----
+
+Create the namespace and install the operator:
+
+[source,bash,role="execute"]
+----
+oc apply -f - <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cert-manager-operator
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: cert-manager-operator
+  namespace: cert-manager-operator
+spec:
+  targetNamespaces:
+  - cert-manager-operator
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: openshift-cert-manager-operator
+  namespace: cert-manager-operator
+spec:
+  channel: stable-v1
+  installPlanApproval: Automatic
+  name: openshift-cert-manager-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+EOF
+----
+
+Wait for the operator to install. This may take a few minutes:
+
+[source,bash,role="execute"]
+----
+echo "Waiting for cert-manager operator to install..."
+sleep 30
+oc get csv -n cert-manager-operator
+----
+
+You should see the ClusterServiceVersion with a phase of `Succeeded`. If it
+shows `Installing`, wait and check again:
+
+[source,bash,role="execute"]
+----
+oc get csv -n cert-manager-operator -o jsonpath='{.items[0].status.phase}'
+echo ""
+----
+
+[Note]
+====
+If the operator is still installing after a minute, you can watch the pods
+come up:
+`oc get pods -n cert-manager -w`
+
+You should eventually see three pods running: `cert-manager`,
+`cert-manager-cainjector`, and `cert-manager-webhook`.
+====
+
+Wait for all cert-manager pods to be ready:
+
+[source,bash,role="execute"]
+----
+oc wait --for=condition=Ready pods --all -n cert-manager --timeout=120s
+----
+
+Verify the three components are running:
+
+[source,bash,role="execute"]
+----
+oc get pods -n cert-manager
+----
+
+You should see:
+
+----
+NAME                                       READY   STATUS    RESTARTS   AGE
+cert-manager-xxxxxxxxxx-xxxxx              1/1     Running   0          ...
+cert-manager-cainjector-xxxxxxxxxx-xxxxx   1/1     Running   0          ...
+cert-manager-webhook-xxxxxxxxxx-xxxxx      1/1     Running   0          ...
+----
+
+==== Verify new API resources
+
+cert-manager adds several new Kubernetes resource types. Let's see them:
+
+[source,bash,role="execute"]
+----
+oc api-resources | grep cert-manager
+----
+
+You should see resources including `certificates`, `certificaterequests`,
+`issuers`, `clusterissuers`, and `orders`.
+
+==== Create a project for our certificate exercises
+
+[source,bash,role="execute"]
+----
+oc new-project cert-lab --display-name="Certificate Management Lab"
+----
+
+==== Create a self-signed ClusterIssuer
+
+An *Issuer* (or *ClusterIssuer*) tells cert-manager how to obtain
+certificates. A self-signed issuer is the simplest — it generates its own
+CA without relying on any external service. This is useful for development,
+testing, and internal services.
+
+[source,bash,role="execute"]
+----
+oc apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned-issuer
+spec:
+  selfSigned: {}
+EOF
+----
+
+Verify the issuer is ready:
+
+[source,bash,role="execute"]
+----
+oc get clusterissuer selfsigned-issuer
+----
+
+You should see:
+
+----
+NAME                READY   AGE
+selfsigned-issuer   True    ...
+----
+
+==== Create a root CA certificate
+
+In practice, you typically create a root CA using the self-signed issuer, and
+then use that CA to sign application certificates. This gives you a proper
+certificate chain.
+
+First, create a root CA certificate:
+
+[source,bash,role="execute"]
+----
+oc apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: lab-root-ca
+  namespace: cert-lab
+spec:
+  isCA: true
+  commonName: lab-root-ca
+  secretName: lab-root-ca-secret
+  duration: 8760h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: selfsigned-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+EOF
+----
+
+Check that the certificate was issued:
+
+[source,bash,role="execute"]
+----
+oc get certificate -n cert-lab lab-root-ca
+----
+
+You should see `READY` as `True`. Examine the certificate details:
+
+[source,bash,role="execute"]
+----
+oc describe certificate -n cert-lab lab-root-ca
+----
+
+Look at the *Events* section at the bottom — you should see an event saying
+the certificate was successfully issued.
+
+The certificate is stored as a TLS *Secret*:
+
+[source,bash,role="execute"]
+----
+oc get secret -n cert-lab lab-root-ca-secret
+----
+
+Decode and examine it:
+
+[source,bash,role="execute"]
+----
+oc get secret -n cert-lab lab-root-ca-secret -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject -issuer -dates
+----
+
+[Note]
+====
+Notice that the **subject** and **issuer** are the same — this is a
+self-signed root CA certificate. When we use this CA to sign application
+certificates, the issuer of those certificates will be this root CA.
+====
+
+==== Create a CA Issuer using the root CA
+
+Now create an *Issuer* that uses our root CA to sign certificates:
+
+[source,bash,role="execute"]
+----
+oc apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: lab-ca-issuer
+  namespace: cert-lab
+spec:
+  ca:
+    secretName: lab-root-ca-secret
+EOF
+----
+
+Verify:
+
+[source,bash,role="execute"]
+----
+oc get issuer -n cert-lab lab-ca-issuer
+----
+
+You should see `READY` as `True`.
+
+==== Request an application certificate
+
+Now let's request a certificate for a sample application, as a developer
+would. This certificate will be signed by our CA issuer:
+
+[source,bash,role="execute"]
+----
+oc apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: my-app-cert
+  namespace: cert-lab
+spec:
+  secretName: my-app-tls
+  duration: 2160h
+  renewBefore: 360h
+  commonName: my-app.cert-lab.svc.cluster.local
+  dnsNames:
+  - my-app.cert-lab.svc.cluster.local
+  - my-app.cert-lab.svc
+  issuerRef:
+    name: lab-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+EOF
+----
+
+Check the certificate status:
+
+[source,bash,role="execute"]
+----
+oc get certificate -n cert-lab my-app-cert
+----
+
+You should see `READY` as `True`. The certificate has been automatically
+generated and stored as a *Secret*.
+
+==== Examine the issued certificate
+
+[source,bash,role="execute"]
+----
+oc get secret -n cert-lab my-app-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -text | head -20
+----
+
+Notice the key details:
+
+* **Issuer** is `lab-root-ca` — our CA signed this certificate
+* **Subject** includes the common name we specified
+* **X509v3 Subject Alternative Name** lists the DNS names we requested
+
+Let's verify the full certificate chain:
+
+[source,bash,role="execute"]
+----
+echo "=== Application Certificate ==="
+oc get secret -n cert-lab my-app-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject -issuer -dates
+echo ""
+echo "=== Root CA Certificate ==="
+oc get secret -n cert-lab lab-root-ca-secret -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject -issuer -dates
+----
+
+The application cert's **issuer** should match the root CA's **subject** —
+confirming the chain of trust.
+
+==== Verify automatic renewal
+
+One of cert-manager's key features is automatic renewal. Let's check the
+renewal schedule:
+
+[source,bash,role="execute"]
+----
+oc describe certificate -n cert-lab my-app-cert | grep -A5 "Status:"
+----
+
+You should see:
+
+* **Not Before** — when the certificate became valid
+* **Not After** — when it expires (90 days from now, per our `duration: 2160h`)
+* **Renewal Time** — when cert-manager will automatically renew it (15 days
+  before expiry, per our `renewBefore: 360h`)
+
+[Note]
+====
+In production, you would integrate cert-manager with an external CA provider
+such as:
+
+* **ACME (Let's Encrypt)** — free, automated, publicly trusted certificates
+* **HashiCorp Vault** — enterprise secret management with PKI backend
+* **Venafi** — enterprise certificate lifecycle management
+* **AWS Private CA / Google CAS** — cloud-native CA services
+
+The workflow is identical — change the *Issuer* configuration to point at
+your CA provider, and cert-manager handles the rest.
+====
+
+==== Use the certificate in a deployment
+
+To demonstrate how an application would use this certificate, let's deploy
+a simple pod that mounts the TLS secret:
+
+[source,bash,role="execute"]
+----
+oc apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-secure-app
+  namespace: cert-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: my-secure-app
+  template:
+    metadata:
+      labels:
+        app: my-secure-app
+    spec:
+      containers:
+      - name: app
+        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+        command: ["sleep", "3600"]
+        volumeMounts:
+        - name: tls
+          mountPath: /etc/tls
+          readOnly: true
+      volumes:
+      - name: tls
+        secret:
+          secretName: my-app-tls
+EOF
+----
+
+Wait for the pod to start:
+
+[source,bash,role="execute"]
+----
+oc rollout status deployment my-secure-app -n cert-lab
+----
+
+Verify the certificate is mounted inside the pod:
+
+[source,bash,role="execute"]
+----
+POD_NAME=$(oc get pods -n cert-lab -l app=my-secure-app -o jsonpath='{.items[0].metadata.name}')
+oc exec -n cert-lab ${POD_NAME} -- ls -la /etc/tls/
+----
+
+You should see `tls.crt`, `tls.key`, and `ca.crt` files. The application
+can use these to serve HTTPS traffic or authenticate to other services.
+
+Verify the certificate content from inside the pod:
+
+[source,bash,role="execute"]
+----
+oc exec -n cert-lab ${POD_NAME} -- cat /etc/tls/tls.crt | openssl x509 -noout -subject -issuer -dates
+----
+
+==== View all cert-manager resources
+
+Let's take a final look at everything cert-manager is managing:
+
+[source,bash,role="execute"]
+----
+echo "=== ClusterIssuers ==="
+oc get clusterissuers
+echo ""
+echo "=== Issuers ==="
+oc get issuers -n cert-lab
+echo ""
+echo "=== Certificates ==="
+oc get certificates -n cert-lab
+echo ""
+echo "=== CertificateRequests ==="
+oc get certificaterequests -n cert-lab
+echo ""
+echo "=== TLS Secrets ==="
+oc get secrets -n cert-lab --field-selector type=kubernetes.io/tls
+----
+
+=== Summary
+
+In this lab you have:
+
+* Examined existing cluster certificates and their expiration dates
+* Identified platform-managed vs user-managed certificates
+* Checked the Service CA, API server, and ingress certificate details
+* Installed the cert-manager Operator from OperatorHub
+* Created a self-signed ClusterIssuer
+* Built a proper CA chain (root CA → CA Issuer → application certificate)
+* Requested and verified an application certificate
+* Mounted the certificate into a running pod
+* Understood how automatic renewal works
+
+The key takeaways:
+
+* Platform-managed certificates renew automatically — monitor but don't touch
+* User-managed certificates (API, ingress, proxy) are your responsibility
+* cert-manager automates application certificate lifecycle
+* Use self-signed issuers for dev/test; integrate with ACME, Vault, or Venafi
+  for production
+* Always check certificate expiration dates as part of your day-2 operations
+
+=== Clean Up
+
+Make sure you login as `kubeadmin` for the next lab:
+
+[source,bash,role="execute"]
+----
+oc login -u kubeadmin -p {{ KUBEADMIN_PASSWORD }}
+----
+
+Remove the resources we created:
+
+[source,bash,role="execute"]
+----
+oc delete project cert-lab
+oc delete clusterissuer selfsigned-issuer
+----
+
+Remove the cert-manager Operator:
+
+[source,bash,role="execute"]
+----
+CSV_NAME=$(oc get csv -n cert-manager-operator -o jsonpath='{.items[0].metadata.name}')
+oc delete subscription openshift-cert-manager-operator -n cert-manager-operator
+oc delete csv ${CSV_NAME} -n cert-manager-operator
+oc delete namespace cert-manager-operator
+----
+
+[Note]
+====
+The cert-manager namespace and its resources will be cleaned up automatically
+when the operator is removed. If you want to keep cert-manager installed for
+other exercises, skip the operator removal commands above.
+====
