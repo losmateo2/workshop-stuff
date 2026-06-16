@@ -45,107 +45,120 @@ the cluster. The default ingress CA is stored in the
 
 [source,bash,role="execute"]
 ----
-oc get configmap -n openshift-config-managed default-ingress-cert -o jsonpath='{.data}' | python3 -m json.tool
+oc get configmap -n openshift-config-managed default-ingress-cert -o yaml
 ----
 
-You can also view the Service CA bundle that is injected into annotated
-ConfigMaps across the cluster. Any ConfigMap annotated with
-`service.beta.openshift.io/inject-cabundle=true` receives this CA:
+You'll see a `ca-bundle.crt` key containing the full ingress certificate
+chain in PEM format.
+
+The Service CA certificate is also stored as a ConfigMap. This is the CA
+that signs certificates for services within the cluster:
 
 [source,bash,role="execute"]
 ----
-oc get configmap -n openshift-service-ca-operator -l app=service-ca-operator 2>/dev/null || echo "No labeled ConfigMaps found in service-ca-operator namespace"
+oc get configmap -n openshift-service-ca-operator openshift-service-ca.crt -o yaml
 ----
 
-[Note]
-====
-The Service CA bundle is not stored as a single ConfigMap you can look up
-directly. Instead, it is injected into ConfigMaps that request it via
-annotation. To see it, you can create a ConfigMap with the annotation and
-OpenShift will inject the CA bundle automatically. We'll see this in action
-later.
-====
+Look for the `service-ca.crt` key — this contains the Service CA
+certificate.
 
 ==== Check API server certificate
 
 The API server certificate is what your `oc` client and the web console use.
-Examine it with `openssl`:
+First, find your API server address:
 
 [source,bash,role="execute"]
 ----
-API_URL=$(oc whoami --show-server)
-API_HOST=$(echo ${API_URL} | sed -e 's|https://||' -e 's|:.*||')
-API_PORT=$(echo ${API_URL} | sed -e 's|.*:||')
-echo "Connecting to ${API_HOST}:${API_PORT}"
-echo | openssl s_client -connect ${API_HOST}:${API_PORT} -servername ${API_HOST} 2>/dev/null | openssl x509 -noout -subject -issuer -dates
+oc whoami --show-server
+----
+
+Use the hostname and port from that output with `openssl` to check the
+certificate. Replace `<api-hostname>` with your API hostname:
+
+[source,bash,role="execute"]
+----
+echo | openssl s_client -connect $(oc whoami --show-server | sed -e 's|https://||') 2>/dev/null | openssl x509 -noout -subject -issuer -dates
 ----
 
 You should see output showing:
 
 * **subject** — the API server hostname
-* **issuer** — the CA that signed it (either the cluster's self-signed CA or
-  a custom CA if one was configured)
+* **issuer** — the CA that signed it
 * **notBefore / notAfter** — the validity period
 
 ==== Check ingress (router) certificate
 
-The ingress certificate secures `*.apps.<cluster>.<domain>` routes. We need
-to connect to an actual route hostname, not the wildcard domain itself:
+The ingress certificate secures `*.apps.<cluster>.<domain>` routes. We'll
+check it by connecting to the console route:
 
 [source,bash,role="execute"]
 ----
-CONSOLE_URL=$(oc whoami --show-console)
-CONSOLE_HOST=$(echo ${CONSOLE_URL} | sed -e 's|https://||' -e 's|/.*||')
-echo "Connecting to ${CONSOLE_HOST}:443"
-echo | openssl s_client -connect ${CONSOLE_HOST}:443 -servername ${CONSOLE_HOST} 2>/dev/null | openssl x509 -noout -subject -issuer -dates
+oc whoami --show-console
+----
+
+Use that hostname with `openssl`:
+
+[source,bash,role="execute"]
+----
+echo | openssl s_client -connect $(oc whoami --show-console | sed 's|https://||'):443 2>/dev/null | openssl x509 -noout -subject -issuer -dates
 ----
 
 ==== List all certificate Secrets in the cluster
 
 Certificates in OpenShift are typically stored as *Secrets* of type
-`kubernetes.io/tls`. Let's find them across all namespaces:
+`kubernetes.io/tls`. Let's see how many exist:
 
 [source,bash,role="execute"]
 ----
-oc get secrets --all-namespaces --field-selector type=kubernetes.io/tls --no-headers 2>/dev/null | wc -l
+oc get secrets --all-namespaces --field-selector type=kubernetes.io/tls
 ----
 
-That number may surprise you — a typical cluster has dozens of TLS secrets.
-Let's look at which namespaces have the most:
-
-[source,bash,role="execute"]
-----
-oc get secrets --all-namespaces --field-selector type=kubernetes.io/tls --no-headers 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -rn | head -15
-----
-
-You'll typically see `openshift-ingress`, `openshift-kube-apiserver`,
-`openshift-kube-apiserver-operator`, and others near the top.
+A typical cluster has dozens (or hundreds) of TLS secrets spread across
+many namespaces.
 
 ==== Check certificate expiration dates
 
-This is one of the most practical day-2 skills. Let's check the expiration
-dates of certificates in the `openshift-ingress` namespace:
+This is one of the most practical day-2 skills. Let's look at the
+certificates in the `openshift-ingress` namespace:
 
 [source,bash,role="execute"]
 ----
-for secret in $(oc get secrets -n openshift-ingress --field-selector type=kubernetes.io/tls -o jsonpath='{.items[*].metadata.name}'); do
-  echo "--- ${secret} ---"
-  oc get secret -n openshift-ingress ${secret} -o jsonpath='{.data.tls\.crt}' | base64 -d 2>/dev/null | openssl x509 -noout -subject -dates 2>/dev/null
-  echo ""
-done
+oc get secrets -n openshift-ingress --field-selector type=kubernetes.io/tls
 ----
 
-Now check certificates in the `openshift-kube-apiserver` namespace. These
-secrets may use different key names, so we'll check both `tls.crt` and
-common alternatives:
+Pick one of the secret names from the output and examine it. For example,
+to check the default router certificate:
 
 [source,bash,role="execute"]
 ----
-for secret in $(oc get secrets -n openshift-kube-apiserver --field-selector type=kubernetes.io/tls -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | head -5); do
-  echo "--- ${secret} ---"
-  oc get secret -n openshift-kube-apiserver ${secret} -o jsonpath='{.data.tls\.crt}' | base64 -d 2>/dev/null | openssl x509 -noout -subject -dates 2>/dev/null
-  echo ""
-done
+oc get secret -n openshift-ingress router-metrics-certs-default -o yaml
+----
+
+The `tls.crt` value is base64-encoded. To decode it and see the expiration
+date:
+
+[source,bash,role="execute"]
+----
+oc extract secret/router-metrics-certs-default -n openshift-ingress --keys=tls.crt --to=- 2>/dev/null | openssl x509 -noout -subject -dates
+----
+
+[Note]
+====
+`oc extract` is the simplest way to pull a file out of a secret. The
+`--to=-` flag prints it to stdout instead of writing a file. We pipe that
+into `openssl` to read the certificate details.
+====
+
+Let's do the same for a kube-apiserver certificate:
+
+[source,bash,role="execute"]
+----
+oc get secrets -n openshift-kube-apiserver --field-selector type=kubernetes.io/tls
+----
+
+[source,bash,role="execute"]
+----
+oc extract secret/etcd-client -n openshift-kube-apiserver --keys=tls.crt --to=- 2>/dev/null | openssl x509 -noout -subject -dates
 ----
 
 [Note]
@@ -168,28 +181,20 @@ The signing key is stored in the `openshift-service-ca` namespace:
 
 [source,bash,role="execute"]
 ----
-oc get secret -n openshift-service-ca signing-key -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject -issuer -dates
+oc extract secret/signing-key -n openshift-service-ca --keys=tls.crt --to=- 2>/dev/null | openssl x509 -noout -subject -issuer -dates
 ----
 
 [Note]
 ====
-If you see an error that the secret was not found, the signing key may be
-named differently in your cluster version. You can find it with:
+If you see an error that the secret was not found, you can list what's
+available with:
 `oc get secrets -n openshift-service-ca`
 ====
 
-==== Check cluster operator certificate status
+==== Check cluster operator status
 
-OpenShift cluster operators report certificate-related issues in their
-conditions. Let's check if any operators are reporting degraded status:
-
-[source,bash,role="execute"]
-----
-oc get clusteroperators -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.conditions[*]}{.type}={.status}{" "}{end}{"\n"}{end}' | grep "Degraded=True"
-----
-
-If nothing is returned, all operators are healthy. You can also get a quick
-overview of all operator conditions:
+OpenShift cluster operators report issues in their conditions. A quick way
+to check if anything is degraded:
 
 [source,bash,role="execute"]
 ----
@@ -197,7 +202,9 @@ oc get clusteroperators
 ----
 
 Look at the `AVAILABLE`, `PROGRESSING`, and `DEGRADED` columns. All
-operators should show `True`, `False`, `False` respectively.
+operators should show `True`, `False`, `False` respectively. Any operator
+showing `Degraded=True` may have a certificate-related issue worth
+investigating.
 
 === Part 2: cert-manager Operator
 
@@ -221,7 +228,7 @@ The cert-manager Operator for Red Hat OpenShift installs into the
 OperatorGroup since it needs to watch Certificate resources across all
 namespaces.
 
-Create the namespace and OperatorGroup:
+Create the namespace:
 
 [source,bash,role="execute"]
 ----
@@ -232,6 +239,8 @@ metadata:
   name: cert-manager-operator
 EOF
 ----
+
+Create the OperatorGroup:
 
 [source,bash,role="execute"]
 ----
@@ -275,18 +284,12 @@ Wait for the operator to install. This may take a few minutes:
 
 [source,bash,role="execute"]
 ----
-echo "Waiting for cert-manager operator to install..."
 sleep 30
 oc get csv -n cert-manager-operator
 ----
 
 You should see the ClusterServiceVersion with a phase of `Succeeded`. If it
-shows `Installing`, wait 30 seconds and check again:
-
-[source,bash,role="execute"]
-----
-oc get csv -n cert-manager-operator -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\n"}{end}'
-----
+shows `Installing`, wait 30 seconds and run the command again.
 
 [Note]
 ====
@@ -299,39 +302,16 @@ is available:
 `oc get catalogsource -n openshift-marketplace redhat-operators`
 ====
 
-Once the CSV shows `Succeeded`, wait for the cert-manager pods to come up in
-the `cert-manager` namespace:
-
-[source,bash,role="execute"]
-----
-oc wait --for=condition=Ready pods --all -n cert-manager --timeout=180s
-----
-
-[Note]
-====
-If the above command times out, the cert-manager namespace may not exist yet.
-Check if the operator has created it:
-`oc get namespace cert-manager`
-
-If it doesn't exist, the operator may still be initializing. Wait another
-30 seconds and try again.
-====
-
-Verify the three components are running:
+Once the CSV shows `Succeeded`, wait for the cert-manager pods to come up:
 
 [source,bash,role="execute"]
 ----
 oc get pods -n cert-manager
 ----
 
-You should see:
-
-----
-NAME                                       READY   STATUS    RESTARTS   AGE
-cert-manager-xxxxxxxxxx-xxxxx              1/1     Running   0          ...
-cert-manager-cainjector-xxxxxxxxxx-xxxxx   1/1     Running   0          ...
-cert-manager-webhook-xxxxxxxxxx-xxxxx      1/1     Running   0          ...
-----
+You should see three pods running: `cert-manager`, `cert-manager-cainjector`,
+and `cert-manager-webhook`. If the namespace doesn't exist yet, the operator
+is still initializing — wait 30 seconds and try again.
 
 ==== Verify new API resources
 
@@ -448,7 +428,7 @@ Decode and examine it:
 
 [source,bash,role="execute"]
 ----
-oc get secret -n cert-lab lab-root-ca-secret -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject -issuer -dates
+oc extract secret/lab-root-ca-secret -n cert-lab --keys=tls.crt --to=- 2>/dev/null | openssl x509 -noout -subject -issuer -dates
 ----
 
 [Note]
@@ -527,7 +507,7 @@ generated and stored as a *Secret*.
 
 [source,bash,role="execute"]
 ----
-oc get secret -n cert-lab my-app-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -text | head -20
+oc extract secret/my-app-tls -n cert-lab --keys=tls.crt --to=- 2>/dev/null | openssl x509 -noout -text | head -20
 ----
 
 Notice the key details:
@@ -536,15 +516,18 @@ Notice the key details:
 * **Subject** includes the common name we specified
 * **X509v3 Subject Alternative Name** lists the DNS names we requested
 
-Let's verify the full certificate chain:
+Let's verify the full certificate chain. Check the application certificate:
 
 [source,bash,role="execute"]
 ----
-echo "=== Application Certificate ==="
-oc get secret -n cert-lab my-app-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject -issuer -dates
-echo ""
-echo "=== Root CA Certificate ==="
-oc get secret -n cert-lab lab-root-ca-secret -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject -issuer -dates
+oc extract secret/my-app-tls -n cert-lab --keys=tls.crt --to=- 2>/dev/null | openssl x509 -noout -subject -issuer -dates
+----
+
+Now check the root CA certificate:
+
+[source,bash,role="execute"]
+----
+oc extract secret/lab-root-ca-secret -n cert-lab --keys=tls.crt --to=- 2>/dev/null | openssl x509 -noout -subject -issuer -dates
 ----
 
 The application cert's **issuer** should match the root CA's **subject** —
@@ -557,22 +540,15 @@ renewal schedule:
 
 [source,bash,role="execute"]
 ----
-oc get certificate -n cert-lab my-app-cert -o jsonpath='{.status.notBefore}{"\n"}{.status.notAfter}{"\n"}{.status.renewalTime}{"\n"}'
+oc describe certificate -n cert-lab my-app-cert
 ----
 
-You should see three timestamps:
+In the output, look for:
 
-* **notBefore** — when the certificate became valid
-* **notAfter** — when it expires (90 days from now, per our `duration: 2160h`)
-* **renewalTime** — when cert-manager will automatically renew it (15 days
+* **Not Before** — when the certificate became valid
+* **Not After** — when it expires (90 days from now, per our `duration: 2160h`)
+* **Renewal Time** — when cert-manager will automatically renew it (15 days
   before expiry, per our `renewBefore: 360h`)
-
-You can also see this in a more readable format:
-
-[source,bash,role="execute"]
-----
-oc describe certificate -n cert-lab my-app-cert | grep -E "Not Before|Not After|Renewal"
-----
 
 [Note]
 ====
@@ -633,44 +609,49 @@ Wait for the pod to start:
 oc rollout status deployment my-secure-app -n cert-lab
 ----
 
-Verify the certificate is mounted inside the pod:
+Verify the certificate files are mounted inside the pod:
 
 [source,bash,role="execute"]
 ----
-POD_NAME=$(oc get pods -n cert-lab -l app=my-secure-app -o jsonpath='{.items[0].metadata.name}')
-oc exec -n cert-lab ${POD_NAME} -- ls -la /etc/tls/
+oc get pods -n cert-lab -l app=my-secure-app
+----
+
+Use the pod name from the output above:
+
+[source,bash,role="execute"]
+----
+oc exec -n cert-lab <pod-name> -- ls -la /etc/tls/
 ----
 
 You should see `tls.crt`, `tls.key`, and `ca.crt` files. The application
 can use these to serve HTTPS traffic or authenticate to other services.
 
-Verify the certificate content by extracting it from the secret directly
-(more reliable than running openssl inside the container):
-
-[source,bash,role="execute"]
-----
-oc get secret -n cert-lab my-app-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject -issuer -dates
-----
-
 ==== View all cert-manager resources
 
-Let's take a final look at everything cert-manager is managing:
+Let's take a final look at everything cert-manager is managing in our lab:
 
 [source,bash,role="execute"]
 ----
-echo "=== ClusterIssuers ==="
 oc get clusterissuers
-echo ""
-echo "=== Issuers ==="
+----
+
+[source,bash,role="execute"]
+----
 oc get issuers -n cert-lab
-echo ""
-echo "=== Certificates ==="
+----
+
+[source,bash,role="execute"]
+----
 oc get certificates -n cert-lab
-echo ""
-echo "=== CertificateRequests ==="
+----
+
+[source,bash,role="execute"]
+----
 oc get certificaterequests -n cert-lab
-echo ""
-echo "=== TLS Secrets ==="
+----
+
+[source,bash,role="execute"]
+----
 oc get secrets -n cert-lab --field-selector type=kubernetes.io/tls
 ----
 
@@ -718,9 +699,15 @@ Remove the cert-manager Operator:
 
 [source,bash,role="execute"]
 ----
-CSV_NAME=$(oc get csv -n cert-manager-operator -o jsonpath='{.items[*].metadata.name}')
 oc delete subscription openshift-cert-manager-operator -n cert-manager-operator
-oc delete csv ${CSV_NAME} -n cert-manager-operator
+oc get csv -n cert-manager-operator
+----
+
+Use the CSV name from the output above:
+
+[source,bash,role="execute"]
+----
+oc delete csv <csv-name> -n cert-manager-operator
 ----
 
 [Note]
