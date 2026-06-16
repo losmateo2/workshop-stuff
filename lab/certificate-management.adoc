@@ -52,7 +52,7 @@ view the service CA bundle:
 
 [source,bash,role="execute"]
 ----
-oc get configmap -n openshift-service-ca-operator signing-cabundle -o yaml | head -30
+oc get configmap -n openshift-service-ca-operator openshift-service-ca.crt -o yaml | head -30
 ----
 
 ==== Check API server certificate
